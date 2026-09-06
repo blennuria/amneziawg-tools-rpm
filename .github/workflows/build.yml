@@ -1,0 +1,186 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build el${{ matrix.el }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - el: 9
+            image: quay.io/centos/centos:stream9
+            mock_config: centos-stream+epel-9-x86_64
+          - el: 10
+            image: quay.io/centos/centos:stream10
+            mock_config: centos-stream+epel-10-x86_64
+
+    # The image must match the target EL: mock builds its bootstrap chroot
+    # from the host repositories, and a cross-release bootstrap fails on GPG
+    # key import. Same reason for --no-bootstrap-image below.
+    container:
+      image: ${{ matrix.image }}
+      # mock needs mount namespaces and overlayfs to set up the chroot
+      options: --privileged
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y --nogpgcheck epel-release
+          dnf install -y --nogpgcheck mock rpm-build git-core
+
+          # mock refuses to run as root: it needs an unprivileged uid to drop
+          # privileges to, and regains root through its setuid wrapper. Group
+          # membership is what lets that wrapper's PAM stack through.
+          useradd -m builder
+          usermod -aG mock builder
+
+      - uses: actions/checkout@v7
+
+      - name: Prepare sources
+        run: |
+          set -eux
+          mkdir -p sources
+          # Take the URL from the spec instead of repeating it here, so a
+          # version bump is a one-line edit in one file.
+          url=$(rpmspec -P amneziawg-tools.spec | awk '$1 == "Source0:" { print $2 }')
+          # Source0 carries a #/basename fragment: strip it for the request,
+          # keep it as the file name mock and rpmbuild expect.
+          curl -fsSL -o "sources/${url##*/}" "${url%%#*}"
+          ls -la sources/
+
+      # A tag carries the release too (3.1.20260812-1), so the same version can
+      # be rebuilt as -2; refuse to publish packages the tag does not name.
+      - name: Check tag matches spec
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          nvr=$(rpmspec -q --srpm --define 'dist %{nil}' \
+                  --qf '%{version}-%{release}\n' amneziawg-tools.spec)
+          test "$GITHUB_REF_NAME" = "$nvr" || {
+            echo "tag $GITHUB_REF_NAME does not match amneziawg-tools.spec $nvr" >&2
+            exit 1
+          }
+
+      - name: Build SRPM
+        run: |
+          set -eux
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
+            --buildsrpm \
+            --spec amneziawg-tools.spec \
+            --sources sources/ \
+            --resultdir result/srpm
+
+      - name: Build RPM
+        run: |
+          runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
+            --rebuild result/srpm/*.src.rpm \
+            --resultdir result/rpm
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpm-el${{ matrix.el }}
+          path: |
+            result/rpm/*.rpm
+            !result/rpm/*.src.rpm
+          if-no-files-found: error
+
+      - name: Upload mock logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-el${{ matrix.el }}
+          path: result/**/*.log
+          if-no-files-found: ignore
+
+  install-test:
+    name: install el${{ matrix.el }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - el: 9
+            image: quay.io/centos/centos:stream9
+          - el: 10
+            image: quay.io/centos/centos:stream10
+
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: rpm-el${{ matrix.el }}
+          path: dist
+
+      - name: Inspect package metadata
+        run: |
+          rpm -qpi dist/amneziawg-tools-[0-9]*.x86_64.rpm
+          rpm -qpR dist/amneziawg-tools-[0-9]*.x86_64.rpm
+          rpm -qlvp dist/amneziawg-tools-[0-9]*.x86_64.rpm
+
+      - name: Install the package
+        run: |
+          # The kernel module is a weak dependency and lives in another repo;
+          # nothing here needs it, awg(8) only talks netlink.
+          dnf install -y --setopt=install_weak_deps=False \
+              dist/amneziawg-tools-[0-9]*.x86_64.rpm
+
+      - name: Smoke-test the tools
+        run: |
+          set -eux
+          awg --version | grep -F "v$(rpm -q --qf '%{VERSION}' amneziawg-tools)"
+          awg genkey | awg pubkey | grep -Eq '^[A-Za-z0-9+/]{43}='
+          key=$(awg genkey); echo "$key" | awg pubkey >/dev/null
+          bash -n /usr/bin/awg-quick
+          # Config dir holds private keys: it must not be world-readable, and
+          # awg-quick must be the one reading it.
+          test "$(stat -c %a /etc/amnezia/amneziawg)" = 700
+          grep -q '/etc/amnezia/amneziawg' /usr/bin/awg-quick
+          grep -q '^ExecStart=/usr/bin/awg-quick up %i$' /usr/lib/systemd/system/awg-quick@.service
+          test -s /usr/share/bash-completion/completions/awg
+          # `man` itself is not installed in the container images, so check the
+          # pages landed rather than that man can find them
+          test -s /usr/share/man/man8/awg.8.gz
+          test -s /usr/share/man/man8/awg-quick.8.gz
+
+  release:
+    name: release
+    needs: install-test
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rpm-el*
+          merge-multiple: true
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Debug packages stay in the run artifacts; the spec lives here and
+          # the build is reproducible from the tag.
+          rm -f dist/*-debuginfo-*.rpm dist/*-debugsource-*.rpm
+          ls -la dist
+          gh release create "$GITHUB_REF_NAME" dist/*.rpm \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
